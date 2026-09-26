@@ -1,15 +1,21 @@
 // include/core/sentinel_scanner.h
 #pragma once
 
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 // Incrementally scans a chunked character stream for a fixed sentinel
 // string that may be split arbitrarily across feed() calls, holding back
 // at most sentinel.size() - 1 trailing bytes at any time.
 class SentinelScanner {
 public:
-    explicit SentinelScanner(std::string sentinel) : sentinel_(std::move(sentinel)) {}
+    explicit SentinelScanner(std::string sentinel) : sentinel_(std::move(sentinel)) {
+        if (sentinel_.empty()) {
+            throw std::invalid_argument("SentinelScanner: sentinel must be non-empty");
+        }
+    }
 
     struct Out {
         std::string safe_text;

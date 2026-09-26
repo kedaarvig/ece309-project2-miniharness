@@ -150,7 +150,8 @@ void test_copy_assignment_deep_copy() {
     assert(b.begin() != a.begin());
 
     // Self-assignment must be a no-op, not a use-after-free.
-    b = b;
+    Conversation& alias = b;  // via alias to avoid -Wself-assign-overloaded
+    b = alias;
     assert(b.size() == 1);
     assert(b.at(0).content() == "a-message");
 }
@@ -258,17 +259,57 @@ void test_scanner_false_alarm_on_partial_match() {
 
 void test_scanner_pending_bounded_across_large_stream() {
     const std::string sentinel = kSentinel;
-    SentinelScanner scanner(sentinel);
     const std::size_t bound = sentinel.size() - 1;
-
     const std::size_t stream_size = 4 * 1024 * 1024;  // 4MB, one byte at a time
-    for (std::size_t i = 0; i < stream_size; ++i) {
-        char c = "abcdefghijklmnopqrstuvwxyz"[i % 26];
-        scanner.feed(std::string(1, c));
+
+    // Two streams: plain text, and an adversarial one made of repeated
+    // near-sentinels ("<|end_conversation|" minus the final '>') so pending_
+    // is constantly full of plausible prefixes.
+    const std::string near_miss = sentinel.substr(0, sentinel.size() - 1);
+    const std::string alphabet = "abcdefghijklmnopqrstuvwxyz";
+    for (int adversarial = 0; adversarial < 2; ++adversarial) {
+        const std::string& pattern = adversarial ? near_miss : alphabet;
+        SentinelScanner scanner(sentinel);
+        std::string emitted;
+        emitted.reserve(stream_size);
+        for (std::size_t i = 0; i < stream_size; ++i) {
+            auto out = scanner.feed(std::string(1, pattern[i % pattern.size()]));
+            assert(!out.sentinel_found);
+            emitted += out.safe_text;
+            assert(scanner.pending_size() <= bound);
+        }
+        emitted += scanner.flush().safe_text;
+        assert(scanner.pending_size() == 0);
+        // Nothing lost or invented: emitted text is exactly the input.
+        assert(emitted.size() == stream_size);
+        for (std::size_t i = 0; i < stream_size; i += 4099) {
+            assert(emitted[i] == pattern[i % pattern.size()]);
+        }
+    }
+
+    // Overlapping prefixes ending in a real sentinel must still be found.
+    SentinelScanner scanner(sentinel);
+    std::string text = near_miss + near_miss + sentinel;
+    std::string safe;
+    bool found = false;
+    for (char c : text) {
+        auto out = scanner.feed(std::string(1, c));
+        safe += out.safe_text;
+        found = found || out.sentinel_found;
         assert(scanner.pending_size() <= bound);
     }
-    scanner.flush();
-    assert(scanner.pending_size() == 0);
+    assert(found);
+    assert(safe + scanner.flush().safe_text == near_miss + near_miss);
+}
+
+void test_scanner_rejects_empty_sentinel() {
+    bool threw = false;
+    try {
+        SentinelScanner scanner("");
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    assert(threw);
 }
 
 // ---- Harness (wiring, not our logic) ---------------------------------------
@@ -330,34 +371,66 @@ void test_harness_stops_at_sentinel() {
 }
 
 void test_transcript_round_trip() {
-    Conversation conv;
-    conv.append(Message(Role::System, "Be concise."));
-    conv.append(Message(Role::User, "hello"));
-    conv.append(Message(Role::Assistant, "Hi! What can I do for you today?"));
-    conv.append(Message(Role::User, "goodbye"));
-    conv.append(Message(Role::Assistant, std::string("Goodbye.") + kSentinel));
+    // 1. Run a real session through the provided Harness.
+    const std::string script_path = "test_round_trip.script";
+    write_script(script_path,
+                 "role: system\n"
+                 "Be concise.\n"
+                 "---\n"
+                 "role: assistant\n"
+                 "Hi! What can I do for you today?\n"
+                 "---\n"
+                 "chunk: 3\n"
+                 "role: assistant\n"
+                 "Goodbye.<|end_conversation|>\n");
 
+    auto first_model = std::make_unique<ScriptedModelClient>(script_path);
+    HarnessConfig cfg;
+    cfg.system_message = first_model->system_message();
+    Harness first(std::move(first_model), cfg);
+    ListInputSource in1({"hello", "goodbye"});
+    CapturingOutputSink out1;
+    StopReason r1 = first.run(in1, out1);
+    assert(r1.kind == StopReason::Kind::Sentinel);
+
+    // 2. Save it (same format as main.cpp's --save) and replay it.
     const std::string transcript_path = "test_transcript_round_trip.txt";
-    write_transcript(transcript_path, conv);
+    write_transcript(transcript_path, first.conversation());
 
-    ReplayModelClient replay(transcript_path);
-    assert(replay.system_message() == "Be concise.");
+    auto replay_model = std::make_unique<ReplayModelClient>(transcript_path);
+    assert(replay_model->system_message() == "Be concise.");
+    HarnessConfig cfg2;
+    cfg2.system_message = replay_model->system_message();
+    Harness second(std::move(replay_model), cfg2);
+    ListInputSource in2({"hello", "goodbye"});
+    CapturingOutputSink out2;
+    StopReason r2 = second.run(in2, out2);
 
+    // 3. The replayed session must be identical.
+    assert(r2.kind == r1.kind);
+    assert(out2.captured() == out1.captured());
+    const Conversation& a = first.conversation();
+    const Conversation& b = second.conversation();
+    assert(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        assert(a.at(i).role() == b.at(i).role());
+        assert(a.at(i).content() == b.at(i).content());
+    }
+
+    // 4. Replay exhausted -> error rather than silent repetition.
     Conversation dummy;
-    Message reply1 = replay.generate(dummy);
-    assert(reply1.content() == "Hi! What can I do for you today?");
-
-    Message reply2 = replay.generate(dummy);
-    assert(reply2.content() == std::string("Goodbye.") + kSentinel);
-
+    ReplayModelClient exhausted(transcript_path);
+    exhausted.generate(dummy);
+    exhausted.generate(dummy);
     bool threw = false;
     try {
-        replay.generate(dummy);
+        exhausted.generate(dummy);
     } catch (const std::runtime_error&) {
         threw = true;
     }
     assert(threw);
 
+    std::remove(script_path.c_str());
     std::remove(transcript_path.c_str());
 }
 
@@ -376,6 +449,7 @@ int main() {
     test_scanner_catches_sentinel_at_every_boundary();
     test_scanner_false_alarm_on_partial_match();
     test_scanner_pending_bounded_across_large_stream();
+    test_scanner_rejects_empty_sentinel();
 
     test_harness_stops_at_turn_limit();
     test_harness_stops_at_sentinel();

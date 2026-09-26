@@ -4,26 +4,38 @@
 #include <stdexcept>
 #include <utility>
 
+namespace {
+
+// Allocates n Messages and copies src[0..n) into them. If any copy throws,
+// the new buffer is released before the exception propagates, so a failed
+// copy never leaks.
+Message* clone_buffer(const Message* src, std::size_t n) {
+    if (n == 0) return nullptr;
+    Message* buf = new Message[n];
+    try {
+        for (std::size_t i = 0; i < n; ++i) buf[i] = src[i];
+    } catch (...) {
+        delete[] buf;
+        throw;
+    }
+    return buf;
+}
+
+}  // namespace
+
 Conversation::~Conversation() {
     delete[] data_;
 }
 
 Conversation::Conversation(const Conversation& other)
-    : data_(other.size_ ? new Message[other.size_] : nullptr),
+    : data_(clone_buffer(other.data_, other.size_)),
       size_(other.size_),
-      capacity_(other.size_) {
-    for (std::size_t i = 0; i < size_; ++i) {
-        data_[i] = other.data_[i];
-    }
-}
+      capacity_(other.size_) {}
 
 Conversation& Conversation::operator=(const Conversation& other) {
     if (this == &other) return *this;
 
-    Message* new_data = other.size_ ? new Message[other.size_] : nullptr;
-    for (std::size_t i = 0; i < other.size_; ++i) {
-        new_data[i] = other.data_[i];
-    }
+    Message* new_data = clone_buffer(other.data_, other.size_);
 
     delete[] data_;
     data_ = new_data;
@@ -56,8 +68,13 @@ Conversation& Conversation::operator=(Conversation&& other) noexcept {
 void Conversation::grow() {
     std::size_t new_capacity = (capacity_ == 0) ? 1 : capacity_ * 2;
     Message* new_data = new Message[new_capacity];
-    for (std::size_t i = 0; i < size_; ++i) {
-        new_data[i] = std::move(data_[i]);
+    try {
+        for (std::size_t i = 0; i < size_; ++i) {
+            new_data[i] = std::move(data_[i]);
+        }
+    } catch (...) {
+        delete[] new_data;
+        throw;
     }
     delete[] data_;
     data_ = new_data;
